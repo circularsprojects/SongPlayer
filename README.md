@@ -2,6 +2,10 @@
 A Fabric mod for Minecraft that plays songs with noteblocks.
 The current version is for Minecraft 1.20.5 - 1.20.6.
 
+modified to add an ImGui interface, default keybind is `I`
+
+also this is really buggy and unpolished, this is just me messin around so some stuff in the imgui menu wont work properly :P
+
 # How to install
 You can grab the mod jar from releases section.
 This mod requires fabric api.

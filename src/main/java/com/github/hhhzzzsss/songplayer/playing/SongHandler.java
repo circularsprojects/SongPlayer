@@ -1,36 +1,48 @@
 package com.github.hhhzzzsss.songplayer.playing;
 
-import com.github.hhhzzzsss.songplayer.Config;
 import com.github.hhhzzzsss.songplayer.FakePlayerEntity;
 import com.github.hhhzzzsss.songplayer.SongPlayer;
 import com.github.hhhzzzsss.songplayer.Util;
-import com.github.hhhzzzsss.songplayer.mixin.ClientPlayerInteractionManagerAccessor;
 import com.github.hhhzzzsss.songplayer.song.*;
-import net.minecraft.block.*;
+import it.unimi.dsi.fastutil.objects.Reference2ObjectArrayMap;
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockState;
+import net.minecraft.block.NoteBlock;
+import net.minecraft.state.property.Properties;
+import net.minecraft.state.property.Property;
+import net.minecraft.block.enums.NoteBlockInstrument;
+import net.minecraft.block.Blocks;
+import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.world.ClientWorld;
-import net.minecraft.component.DataComponentTypes;
+import net.minecraft.component.*;
 import net.minecraft.component.type.BlockStateComponent;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.network.packet.c2s.play.CreativeInventoryActionC2SPacket;
+import net.minecraft.network.packet.c2s.play.PlayerActionC2SPacket;
+import net.minecraft.network.packet.c2s.play.PlayerInteractBlockC2SPacket;
 import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
-import net.minecraft.state.property.Property;
-import net.minecraft.text.*;
+import net.minecraft.sound.SoundCategory;
+import net.minecraft.sound.SoundEvent;
+import net.minecraft.sound.SoundEvents;
+import net.minecraft.text.MutableText;
+import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
-import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.GameMode;
+import net.minecraft.world.World;
 
+import java.io.File;
 import java.io.IOException;
-import java.nio.file.Path;
 import java.util.*;
-import java.util.stream.Collectors;
 
 public class SongHandler {
+    public static ItemStack oldItemHeld = null;
     private static SongHandler instance = null;
     public static SongHandler getInstance() {
         if (instance == null) {
@@ -40,830 +52,750 @@ public class SongHandler {
     }
     private SongHandler() {}
 
-    public SongLoaderThread loaderThread = null;
+    public static SongLoaderThread loaderThread = null;
     public LinkedList<Song> songQueue = new LinkedList<>();
     public Song currentSong = null;
-    public Playlist currentPlaylist = null;
-    public Stage stage = null; // Only exists when playing
-    public Stage lastStage = null; // Stays around even after playing
-    public HashMap<BlockPos, BlockState> originalBlocks = new HashMap<>();
+    public Stage stage = null;
     public boolean building = false;
-    public boolean cleaningUp = false;
-    public boolean dirty = false;
+    public boolean paused = false;
+    int bandaidpatch;
 
-    public boolean wasFlying = false;
-    public GameMode originalGamemode = GameMode.CREATIVE;
-
-    boolean playlistChecked = false;
-
-    public void onUpdate(boolean tick) {
-        if (!cleaningUp) {
-            // Check current playlist and load song from it if necessary
-            if (currentSong == null && currentPlaylist != null && currentPlaylist.loaded) {
-                if (!playlistChecked) {
-                    playlistChecked = true;
-                    if (currentPlaylist.songsFailedToLoad.size() > 0) {
-                        SongPlayer.addChatMessage("§cFailed to load the following songs from the playlist: §4" + String.join(" ", currentPlaylist.songsFailedToLoad));
-                    }
-                }
-                Song nextSong = currentPlaylist.getNext();
-                if (currentPlaylist.songs.size() == 0) {
-                    SongPlayer.addChatMessage("§cPlaylist has no playable songs");
-                    currentPlaylist = null;
-                } else if (nextSong == null) {
-                    SongPlayer.addChatMessage("§6Playlist has finished playing");
-                    currentPlaylist = null;
-                } else {
-                    nextSong.reset();
-                    setSong(nextSong);
-                }
-            }
-
-            // Check queue and load song from it if necessary
-            if (currentSong == null && currentPlaylist == null && songQueue.size() > 0) {
-                setSong(songQueue.poll());
-            }
-
-            // Check if loader thread is finished and handle accordingly
-            if (loaderThread != null && !loaderThread.isAlive()) {
-                if (loaderThread.exception != null) {
-                    SongPlayer.addChatMessage("§cFailed to load song: §4" + loaderThread.exception.getMessage());
-                } else {
-                    if (currentSong == null) {
-                        setSong(loaderThread.song);
-                    } else {
-                        queueSong(loaderThread.song);
-                    }
-                }
-                loaderThread = null;
-            }
+    public void onUpdate(Boolean tick) {
+        if (currentSong == null && songQueue.size() > 0) {
+            setSong(songQueue.poll());
         }
-
-        // Run cached command if timeout reached
-        checkCommandCache();
-
-        // If either playing or doing cleanup
-        if (cleaningUp || currentSong != null) {
-            // Handle creating/removing fake player depending on settings
-            if (Config.getConfig().showFakePlayer && SongPlayer.fakePlayer == null) {
-                SongPlayer.fakePlayer = new FakePlayerEntity();
-                SongPlayer.fakePlayer.copyStagePosAndPlayerLook();
-            }
-            if (!Config.getConfig().showFakePlayer && SongPlayer.fakePlayer != null) {
-                SongPlayer.removeFakePlayer();
-            }
-            if (SongPlayer.fakePlayer != null) {
-                SongPlayer.fakePlayer.getInventory().clone(SongPlayer.MC.player.getInventory());
-            }
-
-            // Maintain flying status
-            wasFlying = SongPlayer.MC.player.getAbilities().flying;
-        }
-
-        // Check if doing cleanup
-        if (cleaningUp) {
-            if (tick) {
-                // Maintain flying status
-                wasFlying = SongPlayer.MC.player.getAbilities().flying;
-
-                handleCleanup();
-            }
-        }
-        // Check if song is playing
-        else if (currentSong != null) {
-            // This should never happen, but I left this check in just in case.
-            if (stage == null) {
-                SongPlayer.addChatMessage("§cStage is null! This should not happen!");
-                reset();
-                return;
-            }
-
-            // Run building or playing tick depending on state
-            if (building) {
-                if (tick) {
-                    handleBuilding();
-                }
+        if (loaderThread != null && !loaderThread.isAlive()) {
+            if (loaderThread.exception != null) {
+                SongPlayer.addChatMessage("§cFailed to load song: §4" + loaderThread.exception.getMessage());
+                Util.advancePlaylist();
             } else {
-                handlePlaying(tick);
-            }
-        }
-        // Otherwise, handle cleanup if necessary
-        else {
-            if (dirty) {
-                if (Config.getConfig().autoCleanup && originalBlocks.size() != 0 && !Config.getConfig().survivalOnly) {
-                    partialResetAndCleanup();
+                if (currentSong == null) {
+                    setSong(loaderThread.song);
                 } else {
-                    restoreStateAndReset();
+                    queueSong(loaderThread.song);
                 }
             }
-            else {
-                // When doing nothing else, record original gamemode
-                originalGamemode = SongPlayer.MC.interactionManager.getCurrentGameMode();
+            loaderThread = null;
+        }
+        if (SongPlayer.recording) {
+            setRecordingDisplay();
+        }
+        if (currentSong == null) {
+            if (songQueue.isEmpty() && Util.playlistSongs.isEmpty()) {
+                if (stage != null || SongPlayer.fakePlayer != null) {
+                    if (stage != null) {
+                        stage.movePlayerToStagePosition(false, false, false);
+                        Util.disableFlightIfNeeded();
+                    }
+                    cleanup(false);
+                }
+            }
+            return;
+        }
+
+        if (stage == null) {
+            stage = new Stage();
+            if (songQueue.isEmpty() && Util.playlistSongs.isEmpty()) {
+                stage.movePlayerToStagePosition(false, false, false);
             }
         }
+        if (SongPlayer.showFakePlayer && SongPlayer.fakePlayer == null && SongPlayer.useNoteblocksWhilePlaying && !paused) {
+            SongPlayer.fakePlayer = new FakePlayerEntity();
+            SongPlayer.fakePlayer.copyStagePosAndPlayerLook();
+        }
+        if (!SongPlayer.showFakePlayer && SongPlayer.fakePlayer != null) {
+            SongPlayer.removeFakePlayer();
+        }
+        checkCommandCache();
+        if (SongPlayer.useNoteblocksWhilePlaying && !paused) {
+            SongPlayer.MC.player.getAbilities().allowFlying = true;
+        }
+        if (building && SongPlayer.useNoteblocksWhilePlaying) {
+            handleBuilding(tick);
+        } else {
+            handlePlaying(tick);
+        }
     }
 
-    public void loadSong(String location) {
+    public void loadSong(String location, File dir) {
         if (loaderThread != null) {
             SongPlayer.addChatMessage("§cAlready loading a song, cannot load another");
+            return;
         }
-        else if (currentPlaylist != null) {
-            SongPlayer.addChatMessage("§cCannot load a song while a playlist is playing");
+        if (SongPlayer.recording) {
+            SongPlayer.addChatMessage("§cCannot load song while recording noteblocks!");
+            return;
         }
-        else {
-            try {
-                loaderThread = new SongLoaderThread(location);
-                SongPlayer.addChatMessage("§6Loading §3" + location);
-                loaderThread.start();
-            } catch (IOException e) {
-                SongPlayer.addChatMessage("§cFailed to load song: §4" + e.getMessage());
+        try {
+            loaderThread = new SongLoaderThread(location, dir);
+            if (Util.currentPlaylist.isEmpty()) {
+                SongPlayer.addChatMessage("§6Loading §3" + location + "");
             }
+            loaderThread.start();
+        } catch (IOException e) {
+            SongPlayer.addChatMessage("§cFailed to load song: §4" + e.getMessage());
         }
     }
 
-    public void loadSong(SongLoaderThread thread) {
-        if (loaderThread != null) {
-            SongPlayer.addChatMessage("§cAlready loading a song, cannot load another");
-        }
-        else if (currentPlaylist != null) {
-            SongPlayer.addChatMessage("§cCannot load a song while a playlist is playing");
-        }
-        else {
-            loaderThread = thread;
-        }
-    }
-
-    // Sets currentSong and sets everything up for building
     public void setSong(Song song) {
-        dirty = true;
         currentSong = song;
-        building = true;
-        if (!Config.getConfig().survivalOnly) setCreativeIfNeeded();
-        if (Config.getConfig().doAnnouncement) {
-            sendMessage(Config.getConfig().announcementMessage.replaceAll("\\[name\\]", song.name));
+        if (!SongPlayer.useNoteblocksWhilePlaying) {
+            Util.assignCommandBlocks(false);
+            building = false;
+            return;
         }
-        prepareStage();
-        if (!Config.getConfig().survivalOnly) getAndSaveBuildSlot();
-        SongPlayer.addChatMessage("§6Building noteblocks");
+        if (stage == null) {
+            stage = new Stage();
+            stage.movePlayerToStagePosition(true, true, false);
+        } else {
+            stage.movePlayerToStagePosition(true, false, true);
+        }
+        pitchesLeft = 0;
+        modifyingblock = false;
+        stage.checkBuildStatus(currentSong);
+        if (!Util.hasEnoughNoteblocks()) {
+            return;
+        }
+        if (stage.nothingToBuild()) { //nothing else needs to be built. Go in survival if needed and play the song
+            setSurvivalIfNeeded();
+            return;
+        }
+        if (SongPlayer.switchGamemode) {
+            SongPlayer.addChatMessage("§6Building noteblocks");
+        } else {
+            SongPlayer.addChatMessage("§6Tuning noteblocks");
+        }
+        building = true;
+        setCreativeIfNeeded();
     }
 
     private void queueSong(Song song) {
+        if (!Util.playlistSongs.isEmpty() || !Util.currentPlaylist.isEmpty()) {
+            SongPlayer.addChatMessage("§cUnable to add song to queue. Playlist is in progress.");
+            return;
+        }
         songQueue.add(song);
-        SongPlayer.addChatMessage("§6Added song to queue: §3" + song.name);
-    }
-
-    public void setPlaylist(Path playlist) {
-        if (loaderThread != null || currentSong != null || !songQueue.isEmpty()) {
-            SongPlayer.addChatMessage("§cCannot start playing a playlist while something else is playing");
+        if (Util.currentPlaylist.isEmpty()) {
+            SongPlayer.addChatMessage("§6Added song to queue: §3" + song.name);
         }
-        else {
-            currentPlaylist = new Playlist(playlist, Config.getConfig().loopPlaylists, Config.getConfig().shufflePlaylists);
-            playlistChecked = false;
-        }
-    }
-
-    public void setPlaylistLoop(boolean loop) {
-        if (currentPlaylist != null) {
-            currentPlaylist.setLoop(loop);
-        }
-    }
-
-    public void setPlaylistShuffle(boolean shuffle) {
-        if (currentPlaylist != null) {
-            currentPlaylist.setShuffle(shuffle);
-        }
-    }
-
-    public void startCleanup() {
-        dirty = true;
-        cleaningUp = true;
-        setCreativeIfNeeded();
-        getAndSaveBuildSlot();
-        lastStage.sendMovementPacketToStagePosition();
     }
 
     // Runs every tick
-    private int buildStartDelay = 0;
-    private int buildEndDelay = 0;
+
     private int buildCooldown = 0;
-    private int buildSlot = -1;
-    private ItemStack prevHeldItem = null;
-    private void handleBuilding() {
+    private int updatePlayerPosCooldown = 0;
+    private int pitchesLeft = 0;
+    private int outoftuneindex = 0;
+    private long buildEndDelay = Calendar.getInstance().getTime().getTime();
+    private boolean modifyingblock = false;
+
+
+    private HashMap<BlockPos, Integer> outOfTune = new HashMap<>();
+    private void handleBuilding(boolean tick) {
+        if (paused) {
+            setPlayProgressDisplay();
+            return;
+        }
+        if (SongPlayer.MC.player.isDead()) {
+            stage.outOfTuneBlocks.clear();
+            Util.pauseSongIfNeeded();
+            SongPlayer.addChatMessage("§6Your song has been paused because you died.\n §6Go back to your stage or find a new location and type §3" + SongPlayer.prefix + "resume§6 to resume playing.");
+            return;
+        }
+        if (!SongPlayer.useNoteblocksWhilePlaying) {
+            return;
+        }
+
+        //handle cooldown
         setBuildProgressDisplay();
-        if (buildStartDelay > 0) {
-            buildStartDelay--;
-            return;
-        }
+
         if (buildCooldown > 0) {
-            buildCooldown--;
+            if (tick || SongPlayer.useFramesInsteadOfTicks) {
+                buildCooldown--;
+            }
             return;
         }
+
+        if (!SongPlayer.useNoteblocksWhilePlaying) {
+            if (updatePlayerPosCooldown > 0 && (tick || SongPlayer.useFramesInsteadOfTicks)) {
+                updatePlayerPosCooldown--;
+            }
+        }
+
         ClientWorld world = SongPlayer.MC.world;
-        if (!Config.getConfig().survivalOnly && SongPlayer.MC.interactionManager.getCurrentGameMode() != GameMode.CREATIVE) {
-            return;
-        }
+        PlayerInventory inventory = SongPlayer.MC.player.getInventory();
 
-        if (stage.nothingToBuild()) { // If there's nothing to build, wait for end delay then check build status
-            if (buildEndDelay > 0) { // Wait for end delay
-                buildEndDelay--;
-                return;
-            } else { // Check build status when end delay is over
-                if (!Config.getConfig().survivalOnly) {
+        if (SongPlayer.switchGamemode) {
+            outoftuneindex = 0;
+
+            if (stage.nothingToBuild()) {
+                if (buildEndDelay > Calendar.getInstance().getTime().getTime()) {
                     stage.checkBuildStatus(currentSong);
-                    recordStageBlocks();
-                } else {
-                    try {
-                        stage.checkSurvivalBuildStatus(currentSong);
-                    } catch (Stage.NotEnoughInstrumentsException e) {
-                        e.giveInstrumentSummary();
-                        restoreStateAndReset();
-                        return;
-                    }
-                }
-                stage.sendMovementPacketToStagePosition();
-            }
-        }
-
-        if (stage.nothingToBuild()) { // If there's still nothing to build after checking build status, switch to playing
-            building = false;
-            if (!Config.getConfig().survivalOnly) {
-                setSurvivalIfNeeded();
-                restoreBuildSlot();
-            }
-            stage.sendMovementPacketToStagePosition();
-            SongPlayer.addChatMessage("§6Now playing §3" + currentSong.name);
-        }
-
-        if (!Config.getConfig().survivalOnly) { // Regular mode
-            if (!stage.requiredBreaks.isEmpty()) {
-                for (int i = 0; i < 5; i++) {
-                    if (stage.requiredBreaks.isEmpty()) break;
-                    BlockPos bp = stage.requiredBreaks.poll();
-                    attackBlock(bp);
-                }
-                buildEndDelay = 20;
-            } else if (!stage.missingNotes.isEmpty()) {
-                int desiredNoteId = stage.missingNotes.pollFirst();
-                BlockPos bp = stage.noteblockPositions.get(desiredNoteId);
-                if (bp == null) {
                     return;
                 }
+                if (oldItemHeld != null) {
+                    inventory.main.set(inventory.selectedSlot, oldItemHeld);
+                    SongPlayer.MC.interactionManager.clickCreativeStack(SongPlayer.MC.player.getStackInHand(Hand.MAIN_HAND), 36 + inventory.selectedSlot);
+                    oldItemHeld = null;
+                }
+                setSurvivalIfNeeded();
+                if (SongPlayer.MC.interactionManager.getCurrentGameMode() != GameMode.SURVIVAL) {
+                    return;
+                }
+                building = false;
+                stage.outOfTuneBlocks.clear();
+                modifyingblock = false;
+                pitchesLeft = 0;
+                return;
+            }
+
+            if (SongPlayer.MC.interactionManager.getCurrentGameMode() != GameMode.CREATIVE) {
+                return;
+            }
+
+            //break blocks that need to be broken if any exist
+            if (!stage.requiredBreaks.isEmpty()) {
+                BlockPos bp = stage.requiredBreaks.poll();
+                attackBlock(bp);
+                buildCooldown = SongPlayer.buildDelay;
+                buildEndDelay = Calendar.getInstance().getTime().getTime() + 500;
+                return;
+            }
+
+            //check if there needs to be any building
+            if (!stage.missingNotes.isEmpty()) {
+                int desiredNoteId = stage.missingNotes.pollFirstEntry().getKey();
+                BlockPos bp = stage.noteblockPositions.get(desiredNoteId);
+
                 int blockId = Block.getRawIdFromState(world.getBlockState(bp));
+                if (blockId % 2 == 0) { //fixes issue with powered=true blockstate
+                    blockId += 1;
+                }
                 int currentNoteId = (blockId - SongPlayer.NOTEBLOCK_BASE_ID) / 2;
                 if (currentNoteId != desiredNoteId) {
-                    holdNoteblock(desiredNoteId, buildSlot);
+                    holdNoteblock(desiredNoteId);
                     if (blockId != 0) {
                         attackBlock(bp);
                     }
                     placeBlock(bp);
                 }
-                buildCooldown = 0; // No cooldown, so it places a block every tick
-                buildEndDelay = 20;
+                buildCooldown = SongPlayer.buildDelay;
+                buildEndDelay = Calendar.getInstance().getTime().getTime() + 500;
+                return;
             }
-        } else { // Survival only mode
-            if (!stage.requiredClicks.isEmpty()) {
-                BlockPos bp = stage.requiredClicks.pollFirst();
-                if (SongPlayer.MC.world.getBlockState(bp).getBlock() == Blocks.NOTE_BLOCK) {
-                    placeBlock(bp);
+        } else { //survival only mode
+            if (outoftuneindex >= stage.outOfTuneBlocks.size() && stage.outOfTuneBlocks.size() > 0) {
+                if (buildEndDelay > Calendar.getInstance().getTime().getTime()) {
+                    return;
                 }
-                buildEndDelay = 20;
+                outoftuneindex = 0;
+                outOfTune.clear();
+                int notright = 0;
+                for (BlockPos test : new ArrayList<>(stage.outOfTuneBlocks.keySet())) {
+                    int blockId = Block.getRawIdFromState(world.getBlockState(test));
+                    if (blockId % 2 == 0) { //fixes issue with powered=true blockstate
+                        blockId += 1;
+                    }
+                    if (blockId < SongPlayer.NOTEBLOCK_BASE_ID || blockId > SongPlayer.NOTEBLOCK_BASE_ID + 800) {
+                        continue;
+                    }
+
+                    int currentBlockId = (blockId - SongPlayer.NOTEBLOCK_BASE_ID) / 2;
+                    int currentPitchId = currentBlockId % 25;
+                    int wantedNoteId = stage.outOfTuneBlocks.get(test);
+                    int wantedPitchId = wantedNoteId % 25;
+
+                    if (currentPitchId != wantedPitchId) {
+                        notright++;
+                        outOfTune.put(test, wantedNoteId);
+                    }
+                }
+                stage.outOfTuneBlocks.clear();
+                if (notright == 0) {
+                    stage.missingNotes.clear();
+                    outOfTune.clear();
+                    buildEndDelay = Calendar.getInstance().getTime().getTime() + 1000;
+                    stage.checkBuildStatus(currentSong);
+                    return;
+                } else {
+                    stage.outOfTuneBlocks.putAll(outOfTune);
+                    buildEndDelay = Calendar.getInstance().getTime().getTime() + 1000;
+                }
+            }
+
+            //check if anything needs to be done
+            if (stage.hasPitchModification() == 0) {
+                outoftuneindex = 0;
+                if (buildEndDelay > Calendar.getInstance().getTime().getTime()) {
+                    return;
+                }
+                stage.checkBuildStatus(currentSong);
+                if (stage.outOfTuneBlocks.size() > 0) { //aaagh someone be messing with ur noteblocks, or your ping is over a full second behind.
+                    return;
+                }
+                building = false;
+                setSurvivalIfNeeded();
+                stage.outOfTuneBlocks.clear();
+                modifyingblock = false;
+                pitchesLeft = 0;
+                return;
+            }
+
+            if (stage.outOfTuneBlocks.isEmpty()) {
+                buildCooldown = SongPlayer.buildDelay;
+                stage.checkBuildStatus(currentSong);
+                pitchesLeft = 0;
+                outoftuneindex = 0;
+                modifyingblock = false;
+                return;
+            }
+
+            buildEndDelay = Calendar.getInstance().getTime().getTime() + 1000;
+            //rebuilding
+            Set<Map.Entry<BlockPos, Integer>> entrySet = stage.outOfTuneBlocks.entrySet();
+            List<Map.Entry<BlockPos, Integer>> entryList = new ArrayList<>(entrySet);
+            int desiredNoteId = entryList.get(outoftuneindex).getValue();
+            BlockPos bp = entryList.get(outoftuneindex).getKey();
+            if (bp == null) {
+                pitchesLeft = 0;
+                outoftuneindex++;
+                modifyingblock = false;
+                return;
+            }
+
+            int blockId = Block.getRawIdFromState(world.getBlockState(bp));
+            if (blockId % 2 == 0) { //fixes issue with powered=true blockstate
+                blockId += 1;
+            }
+
+            if (blockId < SongPlayer.NOTEBLOCK_BASE_ID || blockId > SongPlayer.NOTEBLOCK_BASE_ID + 800) { //target block is not a noteblock, skip it
+                pitchesLeft = 0;
+                outoftuneindex++;
+                modifyingblock = false;
+                return;
+            }
+            if (pitchesLeft > 0 && modifyingblock) {
+                placeBlock(bp);
+                pitchesLeft--;
+            } else {
+                if (modifyingblock) {
+                    pitchesLeft = 0;
+                    outoftuneindex++;
+                    modifyingblock = false;
+                    return;
+                }
+
+                int currentNoteId = ((blockId - SongPlayer.NOTEBLOCK_BASE_ID) / 2) % 25;
+                int currentPitch = currentNoteId % 25;
+                int neededPitch = desiredNoteId % 25;
+                int amountOfPitches = neededPitch - currentPitch;
+                if (currentPitch == neededPitch) {
+                    modifyingblock = false;
+                    outoftuneindex++;
+                    return;
+                }
+                if (amountOfPitches < 0) {
+                    amountOfPitches += 25;
+                }
+                pitchesLeft = amountOfPitches;
+                modifyingblock = true;
             }
         }
+        buildEndDelay = Calendar.getInstance().getTime().getTime() + 500;
+        buildCooldown = SongPlayer.buildDelay;
     }
     private void setBuildProgressDisplay() {
-        MutableText buildText = Text.empty()
-                .append(Text.literal("Building noteblocks | " ).formatted(Formatting.GOLD))
-                .append(Text.literal((stage.totalMissingNotes - stage.missingNotes.size()) + "/" + stage.totalMissingNotes).formatted(Formatting.DARK_AQUA));
-        MutableText playlistText = Text.empty();
-        if (currentPlaylist != null && currentPlaylist.loaded) {
-            playlistText = playlistText.append(Text.literal("Playlist: ").formatted(Formatting.GOLD))
-                    .append(Text.literal(currentPlaylist.name).formatted(Formatting.BLUE))
-                    .append(Text.literal(" | ").formatted(Formatting.GOLD))
-                    .append(Text.literal(String.format(" (%s/%s)", currentPlaylist.songNumber, currentPlaylist.songs.size())).formatted(Formatting.DARK_AQUA));
-            if (currentPlaylist.loop) {
-                playlistText.append(Text.literal(" | Looping").formatted(Formatting.GOLD));
+        MutableText text = Text.empty();
+        MutableText empty = Text.empty(); //why bother re-writing code when you can do a rubberband fix?
+        if (SongPlayer.switchGamemode) {
+            if (stage.totalMissingNotes == 0) {
+                return;
             }
-            if (currentPlaylist.shuffle) {
-                playlistText.append(Text.literal(" | Shuffled").formatted(Formatting.GOLD));
+            text.append(Text.literal("Building noteblocks | ").formatted(Formatting.GOLD));
+            text.append(Text.literal((stage.totalMissingNotes - stage.missingNotes.size() + "/" + stage.totalMissingNotes)).formatted(Formatting.DARK_AQUA));
+        } else {
+            int progress = stage.totalOutOfTuneNotes - stage.hasPitchModification(); // (stage.totalOutOfTuneNotes - (stage.outOfTuneBlocks.size() + stage.hasPitchModification()));
+            if (stage.totalOutOfTuneNotes == 0) {
+                return;
             }
+            text.append(Text.literal("Tuning noteblocks | ").formatted(Formatting.GOLD));
+            text.append(Text.literal(progress + "/" + stage.totalOutOfTuneNotes).formatted(Formatting.DARK_AQUA));
         }
-        ProgressDisplay.getInstance().setText(buildText, playlistText);
+        ProgressDisplay.getInstance().setText(text, empty);
+    }
+
+    private void setRecordingDisplay() {
+        MutableText text = Text.empty();
+        MutableText subtext = Text.empty();
+
+        if (SongPlayer.recordingPaused) {
+            text.append("§6Recording | Paused");
+        } else if (!SongPlayer.recordingActive) {
+            text.append("§6Recording | waiting for noteblock to be played");
+        } else {
+            text.append("§6Recording");
+        }
+        subtext.append("§6notes: §30§6 | time: §3" + Util.formatTime(SongPlayer.recordingtick * 50) + "§6 | ");
+        ProgressDisplay.getInstance().setText(text, subtext);
     }
 
     // Runs every frame
     private void handlePlaying(boolean tick) {
-        if (tick) {
-            setPlayProgressDisplay();
-        }
-
-        if (SongPlayer.MC.interactionManager.getCurrentGameMode() != GameMode.SURVIVAL) {
+        setPlayProgressDisplay();
+        if (paused) {
             currentSong.pause();
             return;
         }
-
-        if (tick) {
-            if (stage.hasBreakingModification()) {
-                if (!Config.getConfig().survivalOnly) {
+        if (SongPlayer.useNoteblocksWhilePlaying) {
+            if (SongPlayer.MC.player.isDead()) {
+                Util.pauseSongIfNeeded();
+                SongPlayer.addChatMessage("§6Your song has been paused because you died.\n §6Go back to your stage or find a new location and type §3" + SongPlayer.prefix + "resume§6 to resume playing.");
+                return;
+            }
+            if (SongPlayer.MC.interactionManager.getCurrentGameMode() != GameMode.SURVIVAL || SongPlayer.MC.player.isSleeping()) {
+                currentSong.pause();
+                return;
+            }
+            if (tick) {
+                if (SongPlayer.switchGamemode || SongPlayer.requireExactInstruments) {
                     stage.checkBuildStatus(currentSong);
-                    recordStageBlocks();
                 } else {
-                    try {
-                        stage.checkSurvivalBuildStatus(currentSong);
-                    } catch (Stage.NotEnoughInstrumentsException e) {
-                        SongPlayer.addChatMessage("§6Stopped because stage is missing instruments required for song.");
-                        reset();
-                        return;
+                    if (stage.hasBreakingModification()) { //only refresh the stage if at least one of the noteblocks are not the correct pitch so your game doesn't turn into a slideshow when playing
+                        stage.checkBuildStatus(currentSong);
                     }
                 }
             }
-            if (!stage.nothingToBuild()) { // Switch to building
+            if (!Util.hasEnoughNoteblocks()) {
+                return;
+            }
+            if (stage.hasPitchModification() > 0) {
                 building = true;
-                if (!Config.getConfig().survivalOnly) setCreativeIfNeeded();
-                stage.sendMovementPacketToStagePosition();
                 currentSong.pause();
-                buildStartDelay = 20;
-                System.out.println("Total missing notes: " + stage.missingNotes.size());
-                for (int note : stage.missingNotes) {
-                    int pitch = note % 25;
-                    int instrumentId = note / 25;
-                    System.out.println("Missing note: " + Instrument.getInstrumentFromId(instrumentId).name() + ":" + pitch);
+                SongPlayer.addChatMessage("§6Stage was altered. Retuning!");
+                return;
+            }
+            if (!stage.nothingToBuild()) {
+                if (!SongPlayer.switchGamemode) {
+                    if (!tick) {
+                        return;
+                    }
+                    paused = true;
+                    SongPlayer.addChatMessage("§6Stage was altered and too many noteblocks were removed or can't be played. Please repair the stage and then type §3" + SongPlayer.prefix + "resume");
+                    return;
                 }
-                if (!Config.getConfig().survivalOnly) getAndSaveBuildSlot();
+                building = true;
+                setCreativeIfNeeded();
+                Util.enableFlightIfNeeded();
+                currentSong.pause();
                 SongPlayer.addChatMessage("§6Stage was altered. Rebuilding!");
                 return;
             }
         }
 
-        currentSong.play();
+        if (Calendar.getInstance().getTime().getTime() < Util.playcooldown) {
+            return;
+        }
 
+        //cooldown is over!
+
+        if (!tick) {
+            return;
+        }
+        currentSong.play();
         boolean somethingPlayed = false;
         currentSong.advanceTime();
+        ClientPlayerEntity player = SongPlayer.MC.player;
+        if (player.isCreative() || player.isSpectator()) {
+            setSurvivalIfNeeded();
+        }
+        if (updatePlayerPosCooldown < 1) {
+            updatePlayerPosCooldown = 10;
+            Util.playerPosX = player.getX();
+            Util.playerPosZ = player.getZ();
+        }
+        SoundEvent[] soundlist = {SoundEvents.BLOCK_NOTE_BLOCK_HARP.value(), SoundEvents.BLOCK_NOTE_BLOCK_BASEDRUM.value(), SoundEvents.BLOCK_NOTE_BLOCK_SNARE.value(), SoundEvents.BLOCK_NOTE_BLOCK_HAT.value(), SoundEvents.BLOCK_NOTE_BLOCK_BASS.value(), SoundEvents.BLOCK_NOTE_BLOCK_FLUTE.value(), SoundEvents.BLOCK_NOTE_BLOCK_BELL.value(), SoundEvents.BLOCK_NOTE_BLOCK_GUITAR.value(), SoundEvents.BLOCK_NOTE_BLOCK_CHIME.value(), SoundEvents.BLOCK_NOTE_BLOCK_XYLOPHONE.value(), SoundEvents.BLOCK_NOTE_BLOCK_IRON_XYLOPHONE.value(), SoundEvents.BLOCK_NOTE_BLOCK_COW_BELL.value(), SoundEvents.BLOCK_NOTE_BLOCK_DIDGERIDOO.value(), SoundEvents.BLOCK_NOTE_BLOCK_BIT.value(), SoundEvents.BLOCK_NOTE_BLOCK_BANJO.value(), SoundEvents.BLOCK_NOTE_BLOCK_PLING.value()};
+        World world = SongPlayer.MC.player.getWorld();
+        ArrayList<Integer> playedNotes = new ArrayList<>();
         while (currentSong.reachedNextNote()) {
             Note note = currentSong.getNextNote();
-            if (note.velocity >= Config.getConfig().velocityThreshold) {
+            Byte voln = note.volume;
+            float volfloat = (float) (voln / 127.0);
+            String volume = String.valueOf(volfloat);
+            if (SongPlayer.parseVolume) {
+                if (SongPlayer.ignoreNoteThreshold > voln) { //skip note - too quiet
+                    continue;
+                }
+                if (volume.length() > 4) {
+                    volume = volume.substring(0, 6);
+                    if (volume.endsWith(".")) {
+                        volume = volume + "0";
+                    } else if (!volume.contains(".")) {
+                        volume = volume + ".0";
+                    }
+                }
+            }
+            if (playedNotes.contains(note.noteId)) {
+                continue;
+            }
+            playedNotes.add(note.noteId);
+            if (SongPlayer.useNoteblocksWhilePlaying) {
                 BlockPos bp = stage.noteblockPositions.get(note.noteId);
                 if (bp != null) {
                     attackBlock(bp);
                     somethingPlayed = true;
                 }
+            } else if (SongPlayer.useCommandsForPlaying) {
+                if (SongPlayer.disablecommandplaynote) {
+                    break;
+                }
+                String[] instrumentNames = {"harp", "basedrum", "snare", "hat", "bass", "flute", "bell", "guitar", "chime", "xylophone", "iron_xylophone", "cow_bell", "didgeridoo", "bit", "banjo", "pling"};
+                int instrument = note.noteId / 25;
+                int pitchID = (note.noteId % 25);
+                double pitch = Math.pow(2, (pitchID + note.pitchCorrection/100.0 - 12) / 12);
+                if (pitch > 2.0) pitch = 2.0;
+                if (pitch < 0.5) pitch = 0.5;
+                String command;
+                if (!SongPlayer.parseVolume) {
+                    volume = "1.0";
+                }
+                command = SongPlayer.playSoundCommand.replace("{type}", instrumentNames[instrument]).replace("{volume}", String.valueOf(volume)).replace("{pitch}", Double.toString(pitch)).replace("{panning}", String.valueOf((note.panning-100)/100.0*2));
+                if (SongPlayer.includeCommandBlocks) {
+                    Util.sendCommandWithCommandblocks(command);
+                } else {
+                    SongPlayer.MC.getNetworkHandler().sendCommand(command);
+                }
+            } else { //play client-side
+                if (SongPlayer.parseVolume) {
+                    player.playSound(soundlist[note.noteId / 25], volfloat, (float) Math.pow(2, (note.noteId % 25 + note.pitchCorrection/100.0 - 12) / 12));
+                } else {
+                    world.playSound(Util.playerPosX, player.getY() + 3000000, Util.playerPosZ, soundlist[note.noteId / 25], SoundCategory.RECORDS, 30000000, (float) Math.pow(2, (note.noteId % 25 + note.pitchCorrection/100.0 - 12) / 12), false);
+                }
             }
         }
+
         if (somethingPlayed) {
             stopAttack();
         }
-
         if (currentSong.finished()) {
-            SongPlayer.addChatMessage("§6Done playing §3" + currentSong.name);
+            Util.playcooldown = Calendar.getInstance().getTime().getTime() + 1500;
+            if (Util.currentPlaylist.isEmpty()) {
+                SongPlayer.addChatMessage("§6Done playing §3" + currentSong.name);
+            }
             currentSong = null;
+            Util.advancePlaylist();
         }
     }
-    private void setPlayProgressDisplay() {
+
+    public void setPlayProgressDisplay() {
         long currentTime = Math.min(currentSong.time, currentSong.length);
         long totalTime = currentSong.length;
-        MutableText songText = Text.empty()
-                .append(Text.literal("Now playing: ").formatted(Formatting.GOLD))
-                .append(Text.literal(currentSong.name).formatted(Formatting.BLUE))
-                .append(Text.literal(" | ").formatted(Formatting.GOLD))
-                .append(Text.literal(String.format("%s/%s", Util.formatTime(currentTime), Util.formatTime(totalTime))).formatted(Formatting.DARK_AQUA));
+
+        MutableText text = Text.empty();
+        MutableText empty = Text.empty(); //I should use this for something... Thanks hhhzzzsss!
+        if (paused) {
+            text.append(Text.literal("Paused ").formatted(Formatting.GOLD));
+        } else {
+            text.append(Text.literal("Now playing ").formatted(Formatting.GOLD));
+        }
+        text.append(Text.literal(currentSong.name).formatted(Formatting.BLUE))
+        .append(Text.literal(" | ").formatted(Formatting.GOLD))
+        .append(Text.literal(String.format("%s/%s", Util.formatTime(currentTime), Util.formatTime(totalTime))).formatted(Formatting.DARK_AQUA));
         if (currentSong.looping) {
             if (currentSong.loopCount > 0) {
-                songText.append(Text.literal(String.format(" | Loop (%d/%d)", currentSong.currentLoop, currentSong.loopCount)).formatted(Formatting.GOLD));
+                text.append(Text.literal(String.format(" | Looping (%d/%d)", currentSong.currentLoop, currentSong.loopCount)).formatted(Formatting.GOLD));
             } else {
-                songText.append(Text.literal(" | Looping enabled").formatted(Formatting.GOLD));
+                text.append(Text.literal(" | Looping enabled").formatted(Formatting.GOLD));
             }
         }
-        MutableText playlistText = Text.empty();
-        if (currentPlaylist != null && currentPlaylist.loaded) {
-            playlistText = playlistText.append(Text.literal("Playlist: ").formatted(Formatting.GOLD))
-                    .append(Text.literal(currentPlaylist.name).formatted(Formatting.BLUE))
-                    .append(Text.literal(" | ").formatted(Formatting.GOLD))
-                    .append(Text.literal(String.format(" (%s/%s)", currentPlaylist.songNumber, currentPlaylist.songs.size())).formatted(Formatting.DARK_AQUA));
-            if (currentPlaylist.loop) {
-                playlistText.append(Text.literal(" | Looping").formatted(Formatting.GOLD));
-            }
-            if (currentPlaylist.shuffle) {
-                playlistText.append(Text.literal(" | Shuffled").formatted(Formatting.GOLD));
-            }
-        }
-        ProgressDisplay.getInstance().setText(songText, playlistText);
-    }
-
-    // Runs every tick
-    private int cleanupTotalBlocksToPlace = 0;
-    private LinkedList<BlockPos> cleanupBreakList = new LinkedList<>();
-    private LinkedList<BlockPos> cleanupPlaceList = new LinkedList<>();
-    private ArrayList<BlockPos> cleanupUnplaceableBlocks = new ArrayList<>();
-    private void handleCleanup() {
-        setCleanupProgressDisplay();
-
-        if (buildStartDelay > 0) {
-            buildStartDelay--;
-            return;
-        }
-        if (buildCooldown > 0) {
-            buildCooldown--;
-            return;
-        }
-        ClientWorld world = SongPlayer.MC.world;
-        if (SongPlayer.MC.interactionManager.getCurrentGameMode() != GameMode.CREATIVE) {
-            return;
-        }
-
-        if (cleanupBreakList.isEmpty() && cleanupPlaceList.isEmpty()) {
-            if (buildEndDelay > 0) {
-                buildEndDelay--;
+        ProgressDisplay.getInstance().setText(text, empty);
+        if (SongPlayer.useCommandsForPlaying && !Util.lastTimeExecuted.equalsIgnoreCase(Util.formatTime(currentTime))) {
+            if (SongPlayer.disablecommanddisplayprogress) {
                 return;
-            } else {
-                checkCleanupStatus();
-                lastStage.sendMovementPacketToStagePosition();
             }
-        }
-
-        if (!cleanupBreakList.isEmpty()) {
-            for (int i=0; i<5; i++) {
-                if (cleanupBreakList.isEmpty()) break;
-                BlockPos bp = cleanupBreakList.poll();
-                attackBlock(bp);
-            }
-            buildEndDelay = 20;
-        } else if (!cleanupPlaceList.isEmpty()) {
-            BlockPos bp = cleanupPlaceList.pollFirst();
-            BlockState actualBlockState = world.getBlockState(bp);
-            BlockState desiredBlockState = originalBlocks.get(bp);
-            if (actualBlockState != desiredBlockState) {
-                holdBlock(desiredBlockState, buildSlot);
-                if (!actualBlockState.isAir() && !actualBlockState.isLiquid()) {
-                    attackBlock(bp);
+            Util.lastTimeExecuted = Util.formatTime(currentTime);
+            String midiname = currentSong.name;
+            String rawcommand = SongPlayer.showProgressCommand;
+            String command = rawcommand.replace("{MIDI}", midiname).replace("{CurrentTime}", Util.formatTime(currentTime)).replace("{SongTime}", Util.formatTime(totalTime));
+            int cmdlength = command.length();
+            if (cmdlength > 254) {
+                while (cmdlength > 250) {
+                    midiname = midiname.substring(0, midiname.length() - 1);
+                    cmdlength -= 1;
                 }
-                placeBlock(bp);
+                midiname = midiname + "...";
+                command = rawcommand.replace("{MIDI}", midiname).replace("{CurrentTime}", Util.formatTime(currentTime)).replace("{SongTime}", Util.formatTime(totalTime));
             }
-            buildCooldown = 0; // No cooldown, so it places a block every tick
-            buildEndDelay = 20;
-        } else {
-            originalBlocks.clear();
-            cleaningUp = false;
-            SongPlayer.addChatMessage("§6Finished restoring original blocks");
-            if (!cleanupUnplaceableBlocks.isEmpty()) {
-                SongPlayer.addChatMessage(String.format("§3%d §6blocks could not be restored", cleanupUnplaceableBlocks.size()));
-            }
-        }
-    }
-    private void checkCleanupStatus() {
-        ClientWorld world = SongPlayer.MC.world;
-
-        cleanupPlaceList.clear();
-        cleanupBreakList.clear();
-        cleanupUnplaceableBlocks.clear();
-
-        for (BlockPos bp : originalBlocks.keySet()) {
-            BlockState actualBlockState = world.getBlockState(bp);
-            BlockState desiredBlockState = originalBlocks.get(bp);
-            if (actualBlockState != desiredBlockState) {
-                if (isPlaceable(desiredBlockState)) {
-                    cleanupPlaceList.add(bp);
-                }
-                if (!actualBlockState.isAir() && !actualBlockState.isLiquid()) {
-                    cleanupBreakList.add(bp);
+            if (SongPlayer.useCommandsForPlaying) {
+                if (SongPlayer.includeCommandBlocks) {
+                    Util.sendCommandWithCommandblocks(command);
+                } else {
+                    SongPlayer.MC.getNetworkHandler().sendCommand(command);
                 }
             }
         }
+    }
 
-        cleanupBreakList = cleanupBreakList.stream()
-                .sorted((a, b) -> {
-                    // First sort by gravity
-                    boolean a_grav = SongPlayer.MC.world.getBlockState(a).getBlock() instanceof FallingBlock;
-                    boolean b_grav = SongPlayer.MC.world.getBlockState(b).getBlock() instanceof FallingBlock;
-                    if (a_grav && !b_grav) {
-                        return 1;
-                    } else if (!a_grav && b_grav) {
-                        return -1;
-                    }
-                    // If there's gravity, sort by y coordinate
-                    if (a_grav && b_grav) {
-                        if (a.getY() < b.getY()) {
-                            return -1;
-                        } else if (a.getY() > b.getY()) {
-                            return 1;
-                        }
-                    }
-                    // Then sort by distance
-                    int a_dx = a.getX() - lastStage.position.getX();
-                    int a_dy = a.getY() - lastStage.position.getY();
-                    int a_dz = a.getZ() - lastStage.position.getZ();
-                    int b_dx = b.getX() - lastStage.position.getX();
-                    int b_dy = b.getY() - lastStage.position.getY();
-                    int b_dz = b.getZ() - lastStage.position.getZ();
-                    int a_dist = a_dx*a_dx + a_dy*a_dy + a_dz*a_dz;
-                    int b_dist = b_dx*b_dx + b_dy*b_dy + b_dz*b_dz;
-                    if (a_dist < b_dist) {
-                        return -1;
-                    } else if (a_dist > b_dist) {
-                        return 1;
-                    }
-                    // Finally sort by angle
-                    double a_angle = Math.atan2(a_dz, a_dx);
-                    double b_angle = Math.atan2(b_dz, b_dx);
-                    if (a_angle < b_angle) {
-                        return -1;
-                    } else if (a_angle > b_angle) {
-                        return 1;
-                    } else {
-                        return 0;
-                    }
-                })
-                .collect(Collectors.toCollection(LinkedList::new));
-
-        cleanupPlaceList = cleanupPlaceList.stream()
-                .sorted((a, b) -> {
-                    // First sort by gravity
-                    boolean a_grav = originalBlocks.get(a).getBlock() instanceof FallingBlock;
-                    boolean b_grav = originalBlocks.get(b).getBlock() instanceof FallingBlock;
-                    if (a_grav && !b_grav) {
-                        return -1;
-                    } else if (!a_grav && b_grav) {
-                        return 1;
-                    }
-                    // If there's gravity, sort by y coordinate
-                    if (a_grav && b_grav) {
-                        if (a.getY() < b.getY()) {
-                            return 1;
-                        } else if (a.getY() > b.getY()) {
-                            return -1;
-                        }
-                    }
-                    // Then sort by distance
-                    int a_dx = a.getX() - lastStage.position.getX();
-                    int a_dy = a.getY() - lastStage.position.getY();
-                    int a_dz = a.getZ() - lastStage.position.getZ();
-                    int b_dx = b.getX() - lastStage.position.getX();
-                    int b_dy = b.getY() - lastStage.position.getY();
-                    int b_dz = b.getZ() - lastStage.position.getZ();
-                    int a_dist = a_dx*a_dx + a_dy*a_dy + a_dz*a_dz;
-                    int b_dist = b_dx*b_dx + b_dy*b_dy + b_dz*b_dz;
-                    if (a_dist < b_dist) {
-                        return -1;
-                    } else if (a_dist > b_dist) {
-                        return 1;
-                    }
-                    // Finally sort by angle
-                    double a_angle = Math.atan2(a_dz, a_dx);
-                    double b_angle = Math.atan2(b_dz, b_dx);
-                    if (a_angle < b_angle) {
-                        return 1;
-                    } else if (a_angle > b_angle) {
-                        return -1;
-                    } else {
-                        return 0;
-                    }
-                })
-                .collect(Collectors.toCollection(LinkedList::new));
-
-        cleanupPlaceList = cleanupPlaceList.reversed();
-        cleanupTotalBlocksToPlace = cleanupPlaceList.size();
-
-        boolean noNecessaryBreaks = cleanupBreakList.stream().allMatch(
-                bp -> world.getBlockState(bp).getBlock().getDefaultState().equals(originalBlocks.get(bp).getBlock().getDefaultState())
-        );
-        boolean noNecessaryPlacements = cleanupPlaceList.stream().allMatch(
-                bp -> bp.equals(lastStage.position)
-                || bp.equals(lastStage.position.up())
-                || world.getBlockState(bp).getBlock().getDefaultState().equals(originalBlocks.get(bp).getBlock().getDefaultState())
-        );
-        if (noNecessaryBreaks && noNecessaryPlacements) {
-            cleanupUnplaceableBlocks.addAll(cleanupPlaceList);
-            cleanupPlaceList.clear();
+    public void cleanup(boolean includePlaylist) {
+        if (!includePlaylist && Util.playlistSongs.size() > 0) {
+            return;
         }
-    }
-    private void setCleanupProgressDisplay() {
-        MutableText buildText = Text.empty()
-                .append(Text.literal("Rebuilding original blocks | " ).formatted(Formatting.GOLD))
-                .append(Text.literal((cleanupTotalBlocksToPlace - cleanupPlaceList.size()) + "/" + cleanupTotalBlocksToPlace).formatted(Formatting.DARK_AQUA));
-        ProgressDisplay.getInstance().setText(buildText, Text.empty());
-    }
-
-    // Resets all internal states like currentSong, and songQueue, which stops all actions
-    public void reset() {
         currentSong = null;
-        currentPlaylist = null;
         songQueue.clear();
         stage = null;
-        buildSlot = -1;
+        paused = false;
+        Util.availableCommandBlocks.clear();
+        Util.playlistSongs.clear();
+        Util.currentPlaylist = "";
+        Util.playlistIndex = 0;
+        Util.loopPlaylist = false;
         SongPlayer.removeFakePlayer();
-        cleaningUp = false;
-        dirty = false;
-    }
-    public void restoreStateAndReset() {
-        if (lastStage != null) {
-            lastStage.movePlayerToStagePosition();
-        }
-        if (originalGamemode != SongPlayer.MC.interactionManager.getCurrentGameMode() && !Config.getConfig().survivalOnly) {
-            if (originalGamemode == GameMode.CREATIVE) {
-                sendGamemodeCommand(Config.getConfig().creativeCommand);
-            }
-            else if (originalGamemode == GameMode.SURVIVAL) {
-                sendGamemodeCommand(Config.getConfig().survivalCommand);
-            }
-        }
-        if (SongPlayer.MC.player.getAbilities().allowFlying == false) {
-            SongPlayer.MC.player.getAbilities().flying = false;
-        }
-        if (!Config.getConfig().survivalOnly) restoreBuildSlot();
-        reset();
-    }
-    public void partialResetAndCleanup() {
-        restoreBuildSlot();
-        currentSong = null;
-        currentPlaylist = null;
-        songQueue.clear();
-        stage = null;
-        buildSlot = -1;
-        startCleanup();
+        ProgressDisplay.getInstance().setText(Text.literal(""), Text.literal(""));
     }
 
-    // Runs every frame when player is not ingame
     public void onNotIngame() {
         currentSong = null;
-        currentPlaylist = null;
         songQueue.clear();
-    }
-
-    // Create stage if it doesn't exist and move the player to it
-    private void prepareStage() {
-        if (stage == null) {
-            stage = new Stage();
-            lastStage = stage;
-            originalBlocks.clear();
-            stage.movePlayerToStagePosition();
-        }
-        else {
-            stage.sendMovementPacketToStagePosition();
-        }
+        Util.playlistSongs.clear();
+        Util.currentPlaylist = "";
+        Util.playlistIndex = 0;
     }
 
     private long lastCommandTime = System.currentTimeMillis();
     private String cachedCommand = null;
-    private String cachedMessage = null;
     private void sendGamemodeCommand(String command) {
         cachedCommand = command;
     }
-    private void sendMessage(String message) {
-        cachedMessage = message;
-    }
     private void checkCommandCache() {
-        long currentTime = System.currentTimeMillis();
-        if (currentTime >= lastCommandTime + 1500 && cachedCommand != null) {
+        //does not handle useCommandsForPlaying mode
+        if (cachedCommand == null) return;
+        if (System.currentTimeMillis() >= lastCommandTime + 1500 || (SongPlayer.MC.player.hasPermissionLevel(2) && System.currentTimeMillis() >= lastCommandTime + 250)) {
             SongPlayer.MC.getNetworkHandler().sendCommand(cachedCommand);
             cachedCommand = null;
-            lastCommandTime = currentTime;
-        }
-        else if (currentTime >= lastCommandTime + 500 && cachedMessage != null) {
-            if (cachedMessage.startsWith("/")) {
-                SongPlayer.MC.getNetworkHandler().sendCommand(cachedMessage.substring(1));
-            }
-            else {
-                SongPlayer.MC.getNetworkHandler().sendChatMessage(cachedMessage);
-            }
-            cachedMessage = null;
-            lastCommandTime = currentTime;
+            lastCommandTime = System.currentTimeMillis();
         }
     }
     private void setCreativeIfNeeded() {
         cachedCommand = null;
+        if (!SongPlayer.switchGamemode) {
+            return;
+        }
+        if (SongPlayer.disablecommandcreative) {
+            return;
+        }
         if (SongPlayer.MC.interactionManager.getCurrentGameMode() != GameMode.CREATIVE) {
-            sendGamemodeCommand(Config.getConfig().creativeCommand);
+            sendGamemodeCommand(SongPlayer.creativeCommand);
         }
     }
     private void setSurvivalIfNeeded() {
         cachedCommand = null;
+        if (!SongPlayer.switchGamemode) {
+            return;
+        }
+        if (SongPlayer.disablecommandsurvival) {
+            return;
+        }
+        if (oldItemHeld != null) {
+            CreativeInventoryActionC2SPacket packet = new CreativeInventoryActionC2SPacket(SongPlayer.MC.player.getInventory().selectedSlot + 36, oldItemHeld);
+            SongPlayer.MC.player.networkHandler.sendPacket(packet);
+            PlayerInventory inventory = SongPlayer.MC.player.getInventory();
+            SongPlayer.MC.player.getInventory().main.set(inventory.selectedSlot, oldItemHeld.copy());
+            SongPlayer.MC.interactionManager.clickCreativeStack(SongPlayer.MC.player.getStackInHand(Hand.MAIN_HAND), 36 + inventory.selectedSlot);
+            oldItemHeld = null;
+        }
         if (SongPlayer.MC.interactionManager.getCurrentGameMode() != GameMode.SURVIVAL) {
-            sendGamemodeCommand(Config.getConfig().survivalCommand);
+            sendGamemodeCommand(SongPlayer.survivalCommand);
         }
     }
 
+    //private final Instrument[] instruments = {Instrument.HARP, Instrument.BASEDRUM, Instrument.SNARE, Instrument.HAT, Instrument.BASS, Instrument.FLUTE, Instrument.BELL, Instrument.GUITAR, Instrument.CHIME, Instrument.XYLOPHONE, Instrument.IRON_XYLOPHONE, Instrument.COW_BELL, Instrument.DIDGERIDOO, Instrument.BIT, Instrument.BANJO, Instrument.PLING};
+    private final NoteBlockInstrument[] instruments = {NoteBlockInstrument.HARP, NoteBlockInstrument.BASEDRUM, NoteBlockInstrument.SNARE, NoteBlockInstrument.HAT, NoteBlockInstrument.BASS, NoteBlockInstrument.FLUTE, NoteBlockInstrument.BELL, NoteBlockInstrument.GUITAR, NoteBlockInstrument.CHIME, NoteBlockInstrument.XYLOPHONE, NoteBlockInstrument.IRON_XYLOPHONE, NoteBlockInstrument.COW_BELL, NoteBlockInstrument.DIDGERIDOO, NoteBlockInstrument.BIT, NoteBlockInstrument.BANJO, NoteBlockInstrument.PLING};
     private final String[] instrumentNames = {"harp", "basedrum", "snare", "hat", "bass", "flute", "bell", "guitar", "chime", "xylophone", "iron_xylophone", "cow_bell", "didgeridoo", "bit", "banjo", "pling"};
-    private void holdNoteblock(int id, int slot) {
+    private void holdNoteblock(int id) {
         PlayerInventory inventory = SongPlayer.MC.player.getInventory();
-        inventory.selectedSlot = slot;
-        ((ClientPlayerInteractionManagerAccessor) SongPlayer.MC.interactionManager).invokeSyncSelectedSlot();
+        if (oldItemHeld == null) {
+            oldItemHeld = inventory.getMainHandStack();
+        }
+        bandaidpatch = id;
         int instrument = id/25;
         int note = id%25;
-        ItemStack noteblockStack = Items.NOTE_BLOCK.getDefaultStack();
-        noteblockStack.set(DataComponentTypes.BLOCK_STATE, new BlockStateComponent(Map.of(
+
+        ItemStack noteblock = Items.NOTE_BLOCK.getDefaultStack();
+        BlockStateComponent bsc = new BlockStateComponent(Map.of(
                 "instrument", instrumentNames[instrument],
                 "note", Integer.toString(note)
-        )));
-        inventory.main.set(slot, noteblockStack);
-        SongPlayer.MC.interactionManager.clickCreativeStack(noteblockStack, 36 + slot);
+        ));
+        noteblock.set(DataComponentTypes.BLOCK_STATE, bsc);
+
+        inventory.main.set(inventory.selectedSlot, noteblock);
+        SongPlayer.MC.interactionManager.clickCreativeStack(SongPlayer.MC.player.getStackInHand(Hand.MAIN_HAND), 36 + inventory.selectedSlot);
     }
-    private void holdBlock(BlockState bs, int slot) {
-        PlayerInventory inventory = SongPlayer.MC.player.getInventory();
-        inventory.selectedSlot = slot;
-        ((ClientPlayerInteractionManagerAccessor) SongPlayer.MC.interactionManager).invokeSyncSelectedSlot();
-        ItemStack stack = new ItemStack(bs.getBlock());
-        Map<String, String> stateMap = new TreeMap<>();
-        for (Map.Entry<Property<?>, Comparable<?>> entry : bs.getEntries().entrySet()) {
-            Property<?> property = entry.getKey();
-            Comparable<?> value = entry.getValue();
-            stateMap.put(property.getName(), net.minecraft.util.Util.getValueAsString(property, value));
-        }
-        stack.set(DataComponentTypes.BLOCK_STATE, new BlockStateComponent(stateMap));
-        inventory.main.set(slot, stack);
-        SongPlayer.MC.interactionManager.clickCreativeStack(stack, 36 + slot);
-    }
+
     private void placeBlock(BlockPos bp) {
-        double fx = Math.max(0.0, Math.min(1.0, (lastStage.position.getX() + 0.5 - bp.getX())));
-        double fy = Math.max(0.0, Math.min(1.0, (lastStage.position.getY() + 0.0 - bp.getY())));
-        double fz = Math.max(0.0, Math.min(1.0, (lastStage.position.getZ() + 0.5 - bp.getZ())));
+        double fx = Math.max(0.0, Math.min(1.0, (stage.position.getX() - bp.getX())));
+        double fy = Math.max(0.0, Math.min(1.0, (stage.position.getY() + 0.0 - bp.getY())));
+        double fz = Math.max(0.0, Math.min(1.0, (stage.position.getZ() - bp.getZ())));
         fx += bp.getX();
         fy += bp.getY();
         fz += bp.getZ();
-        SongPlayer.MC.interactionManager.interactBlock(SongPlayer.MC.player, Hand.MAIN_HAND, new BlockHitResult(new Vec3d(fx, fy, fz), Direction.UP, bp, false));
-        doMovements(fx, fy, fz);
+
+        if (SongPlayer.rotate) {
+            float[] pitchandyaw = Util.getAngleAtBlock(bp);
+            PlayerMoveC2SPacket packet = new PlayerMoveC2SPacket.LookAndOnGround(pitchandyaw[1], pitchandyaw[0], true);
+            SongPlayer.MC.player.networkHandler.sendPacket(packet);
+        }
+        if (SongPlayer.usePacketsOnlyWhilePlaying) {
+            if (SongPlayer.switchGamemode) {
+                SongPlayer.MC.player.getWorld().playSound(bp.getX(), bp.getY(), bp.getZ(), Blocks.NOTE_BLOCK.getDefaultState().getSoundGroup().getBreakSound(), SoundCategory.BLOCKS, 1f, 0.8f, true);
+                //SongPlayer.MC.player.getWorld().setBlockState(bp, Blocks.NOTE_BLOCK.getDefaultState().with(Properties.INSTRUMENT, instruments[bandaidpatch/25]).with(Properties.NOTE, bandaidpatch%25));
+
+                //new BlockState(Map.of(
+                //                        "instrument", instrumentNames[bandaidpatch/25],
+                //                        "note", Integer.toString(bandaidpatch%25)
+                //                ))
+//                SongPlayer.MC.player.getWorld().setBlockState(bp, Blocks.NOTE_BLOCK.getDefaultState().with(Properties.BLOCK_STATE, new BlockStateComponent(Map.of(
+//                        "instrument", instrumentNames[bandaidpatch/25],
+//                        "note", Integer.toString(bandaidpatch%25)
+//                ))));
+
+                // use something other than properties.block_state. it doesn't work
+                SongPlayer.MC.player.getWorld().setBlockState(bp, Blocks.NOTE_BLOCK.getDefaultState().with(Properties.INSTRUMENT, instruments[bandaidpatch/25]).with(Properties.NOTE, bandaidpatch%25));
+            }
+            PlayerInteractBlockC2SPacket packet = new PlayerInteractBlockC2SPacket(SongPlayer.MC.player.getActiveHand(), new BlockHitResult(new Vec3d(fx, fy, fz), Direction.DOWN, bp, false), 0);
+            SongPlayer.MC.getNetworkHandler().sendPacket(packet);
+        } else {
+            SongPlayer.MC.interactionManager.interactBlock(SongPlayer.MC.player, Hand.MAIN_HAND, new BlockHitResult(new Vec3d(fx, fy, fz), Direction.DOWN, bp, false));
+        }
+        if (SongPlayer.swing) {
+            Util.swingHand();
+        }
     }
     private void attackBlock(BlockPos bp) {
-        SongPlayer.MC.interactionManager.attackBlock(bp, Direction.UP);
-        doMovements(bp.getX() + 0.5, bp.getY() + 0.5, bp.getZ() + 0.5);
+        ClientPlayerEntity player = SongPlayer.MC.player;
+        if (SongPlayer.rotate) {
+            float[] pitchandyaw = Util.getAngleAtBlock(bp);
+            PlayerMoveC2SPacket packet = new PlayerMoveC2SPacket.LookAndOnGround(pitchandyaw[1], pitchandyaw[0], true);
+            player.networkHandler.sendPacket(packet);
+        }
+        if (SongPlayer.usePacketsOnlyWhilePlaying) {
+            if (SongHandler.getInstance().building && SongPlayer.switchGamemode) {
+                SongPlayer.MC.world.playSound(bp.getX(), bp.getY(), bp.getZ(), SongPlayer.MC.world.getBlockState(bp).getBlock().getDefaultState().getSoundGroup().getBreakSound(), SoundCategory.BLOCKS, 1f, 0.8f, true);
+                SongPlayer.MC.world.setBlockState(bp, Blocks.AIR.getDefaultState());
+            }
+            PlayerActionC2SPacket attack = new PlayerActionC2SPacket(PlayerActionC2SPacket.Action.START_DESTROY_BLOCK, bp, Direction.DOWN);
+            PlayerActionC2SPacket stopattack = new PlayerActionC2SPacket(PlayerActionC2SPacket.Action.ABORT_DESTROY_BLOCK, bp, Direction.DOWN);
+            SongPlayer.MC.getNetworkHandler().sendPacket(attack);
+            SongPlayer.MC.getNetworkHandler().sendPacket(stopattack);
+        } else {
+            SongPlayer.MC.interactionManager.attackBlock(bp, Direction.DOWN);
+        }
+
+        if (SongPlayer.swing) {
+            Util.swingHand();
+        }
     }
     private void stopAttack() {
-        SongPlayer.MC.interactionManager.cancelBlockBreaking();
-    }
-    private void recordBlocks(Iterable<BlockPos> bpList) {
-        for (BlockPos bp : bpList) {
-            if (!originalBlocks.containsKey(bp)) {
-                BlockState bs = SongPlayer.MC.world.getBlockState(bp);
-                originalBlocks.put(bp, bs);
-            }
+        if (!SongPlayer.usePacketsOnlyWhilePlaying) {
+            SongPlayer.MC.interactionManager.cancelBlockBreaking();
         }
-    }
-    private void recordStageBlocks() {
-        recordBlocks(stage.requiredBreaks);
-        recordBlocks(stage.missingNotes
-                .stream()
-                .map(noteId -> stage.noteblockPositions.get(noteId))
-                .filter(Objects::nonNull)
-                .toList()
-        );
-    }
-    private boolean isPlaceable(BlockState bs) {
-        Map<Property<?>, Comparable<?>> entries = bs.getEntries();
-        for (Map.Entry<Property<?>, Comparable<?>> entry : entries.entrySet()) {
-            Property<?> property = entry.getKey();
-            Comparable<?> value = entry.getValue();
-            String propertyName = property.getName();
-            String valueName = net.minecraft.util.Util.getValueAsString(property, value);
-            if (propertyName.equals("half") && valueName.equals("upper")) {
-                return false;
-            }
-        }
-        Block block = bs.getBlock();
-        if (bs.isAir() || bs.isLiquid()) {
-            return false;
-        } else if (block instanceof DoorBlock || block instanceof BedBlock) {
-            return false;
-        } else {
-            return true;
-        }
-    }
-
-    private void doMovements(double lookX, double lookY, double lookZ) {
-        if (Config.getConfig().swing) {
-            SongPlayer.MC.player.swingHand(Hand.MAIN_HAND);
-            if (SongPlayer.fakePlayer != null) {
-                SongPlayer.fakePlayer.swingHand(Hand.MAIN_HAND);
-            }
-        }
-        if (Config.getConfig().rotate) {
-            double d = lookX - (lastStage.position.getX() + 0.5);
-            double e = lookY - (lastStage.position.getY() + SongPlayer.MC.player.getStandingEyeHeight());
-            double f = lookZ - (lastStage.position.getZ() + 0.5);
-            double g = Math.sqrt(d * d + f * f);
-            float pitch = MathHelper.wrapDegrees((float) (-(MathHelper.atan2(e, g) * 57.2957763671875)));
-            float yaw = MathHelper.wrapDegrees((float) (MathHelper.atan2(f, d) * 57.2957763671875) - 90.0f);
-            if (SongPlayer.fakePlayer != null) {
-                SongPlayer.fakePlayer.setPitch(pitch);
-                SongPlayer.fakePlayer.setYaw(yaw);
-                SongPlayer.fakePlayer.setHeadYaw(yaw);
-            }
-            SongPlayer.MC.player.networkHandler.getConnection().send(new PlayerMoveC2SPacket.Full(
-                    lastStage.position.getX() + 0.5, lastStage.position.getY(), lastStage.position.getZ() + 0.5,
-                    yaw, pitch,
-                    true));
-        }
-    }
-
-    private void getAndSaveBuildSlot() {
-        buildSlot = SongPlayer.MC.player.getInventory().getSwappableHotbarSlot();
-        prevHeldItem = SongPlayer.MC.player.getInventory().getStack(buildSlot);
-    }
-    private void restoreBuildSlot() {
-        if (buildSlot != -1) {
-            SongPlayer.MC.player.getInventory().setStack(buildSlot, prevHeldItem);
-            SongPlayer.MC.interactionManager.clickCreativeStack(prevHeldItem, 36 + buildSlot);
-            buildSlot = -1;
-        }
-    }
-
-    public boolean isIdle() {
-        return currentSong == null && currentPlaylist == null && songQueue.isEmpty() && !cleaningUp && !dirty;
     }
 }

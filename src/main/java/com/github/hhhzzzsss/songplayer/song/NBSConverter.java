@@ -1,8 +1,4 @@
-package com.github.hhhzzzsss.songplayer.conversion;
-
-import com.github.hhhzzzsss.songplayer.song.Instrument;
-import com.github.hhhzzzsss.songplayer.song.Note;
-import com.github.hhhzzzsss.songplayer.song.Song;
+package com.github.hhhzzzsss.songplayer.song;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -43,7 +39,7 @@ public class NBSConverter {
         public String name;
         public byte lock = 0;
         public byte volume;
-        public byte stereo = 100;
+        public byte stereo = 127;
     }
 
     public static Song getSongFromBytes(byte[] bytes, String fileName) throws IOException {
@@ -109,7 +105,7 @@ public class NBSConverter {
                 note.key = buffer.get();
                 if (format >= 4) {
                     note.velocity = buffer.get();
-                    note.panning = buffer.get();
+                    note.panning = (byte) (buffer.get() & 0xff);
                     note.pitch = buffer.getShort();
                 }
                 nbsNotes.add(note);
@@ -140,28 +136,22 @@ public class NBSConverter {
         }
         for (NBSNote note : nbsNotes) {
             Instrument instrument;
-            if (note.instrument < instrumentIndex.length) {
-                instrument = instrumentIndex[note.instrument];
+            if (note.instrument >= instrumentIndex.length) {
+                continue;
             }
-            else {
+            if (note.key < 33 || note.key > 57) {
                 continue;
             }
 
-            while (note.key < 33) {
-                note.key += 12;
-            }
-            while (note.key > 57) {
-                note.key -= 12;
-            }
+            instrument = instrumentIndex[note.instrument];
 
-            byte layerVolume = 100;
+            byte layerVolume = 100; //is this variable assigned to the volume of the note? I didn't think nbs files had such a feature.
             if (nbsLayers.size() > note.layer) {
                 layerVolume = nbsLayers.get(note.layer).volume;
             }
-
             int pitch = note.key-33;
             int noteId = pitch + instrument.instrumentId*25;
-            song.add(new Note(noteId, getMilliTime(note.tick, tempo), layerVolume));
+            song.add(new Note(noteId, getMilliTime(note.tick, tempo), (byte) (note.velocity/100.0*layerVolume/100.0*127), note.pitch, note.panning));
         }
 
         song.length = song.get(song.size()-1).time + 50;
@@ -174,9 +164,13 @@ public class NBSConverter {
         if (length > maxSize) {
             throw new IOException("String is too large");
         }
-        byte[] arr = new byte[length];
+        byte arr[] = new byte[length];
         buffer.get(arr, 0, length);
         return new String(arr);
+    }
+
+    public static void convert(Song song) {
+
     }
 
     private static int getMilliTime(int tick, int tempo) {

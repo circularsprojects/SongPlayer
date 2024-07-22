@@ -1,19 +1,27 @@
 package com.github.hhhzzzsss.songplayer.song;
 
+import org.jetbrains.annotations.Nullable;
+
 public class Note implements Comparable<Note> {
 	public int noteId;
 	public long time;
-	public int velocity;
-	public Note(int note, long time) {
+	public byte volume;
+	public short pitchCorrection;
+	public int panning;
+	public Note(int note, long time, byte volume, short pitchCorrection) {
 		this.noteId = note;
 		this.time = time;
-		this.velocity = 100;
+		this.volume = volume;
+		this.pitchCorrection = pitchCorrection;
+		panning = 100;
 	}
 
-	public Note(int note, long time, int velocity) {
+	public Note(int note, long time, byte volume, short pitchCorrection, int panning) {
 		this.noteId = note;
 		this.time = time;
-		this.velocity = velocity;
+		this.volume = volume;
+		this.pitchCorrection = pitchCorrection;
+		this.panning = panning;
 	}
 
 	@Override
@@ -22,12 +30,6 @@ public class Note implements Comparable<Note> {
 			return -1;
 		}
 		else if (time > other.time) {
-			return 1;
-		}
-		else if (noteId < other.noteId) {
-			return -1;
-		}
-		else if (noteId > other.noteId) {
 			return 1;
 		}
 		else {
