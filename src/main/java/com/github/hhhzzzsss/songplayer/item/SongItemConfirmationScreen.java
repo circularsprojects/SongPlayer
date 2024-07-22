@@ -71,7 +71,12 @@ public class SongItemConfirmationScreen extends Screen {
                         String.format("§7Avg notes per second: %s%.2f", getNumberColor(loaderThread.avgNotesPerSecond), loaderThread.avgNotesPerSecond),
                 };
                 List<Text> messageList = Arrays.stream(loadedMessages).map(Text::literal).collect(Collectors.toList());
-                this.loadedText = MultilineText.createFromTexts(this.textRenderer, messageList);
+                //this.loadedText = MultilineText.createFromTexts(this.textRenderer, messageList);
+
+                // convert the messageList to a Text[] object
+                Text[] messageListArray = new Text[messageList.size()];
+                messageListArray = messageList.toArray(messageListArray);
+                this.loadedText = MultilineText.create(this.textRenderer, messageListArray);
 
                 int loadedTextHeight = this.loadedText.count() * this.textRenderer.fontHeight;
                 addButtons(60 + loadedTextHeight + 12);
